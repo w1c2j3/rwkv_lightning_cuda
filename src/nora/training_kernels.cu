@@ -1,3 +1,9 @@
+#ifdef RWKV_USE_HIP
+#include <hipblas/hipblas.h>
+#include <hipblaslt/hipblaslt.h>
+#include <map>
+#include <tuple>
+#endif
 #include "rwkv/bf16_training/nora.hpp"
 #include "rwkv/bf16_training/ops.hpp"
 #include "rwkv/runtime/nora_gemm.cuh"
@@ -18,8 +24,7 @@ void validate(int rows, const rwkv_bf16_miss::Linear &w) {
 void checked() {
   rwkv_bf16_training::gpu_check(cudaGetLastError(), "NoRA kernel");
 }
-#ifndef RWKV_USE_HIP
-// Tensor-core path, used when the thread's GEMM policy is not consistent
+// Tensor-core / MFMA Matrix-core path, used when the thread's GEMM policy is not consistent
 // (--gemm-mode auto): cuBLAS BF16 products with FP32 accumulation instead of
 // the FP32 SIMT kernels. An FP32 latent (or its adjoint) enters a product as
 // the exact BF16 pair hi + lo, about 16 mantissa bits, so results stay within
@@ -67,19 +72,55 @@ __global__ void accum_grad_a_pair(int rank, int in, const float *__restrict__ gp
     return;
   dst[i] += gp[i] + gp[total + i];
 }
+#ifdef RWKV_USE_HIP
+struct NoraHipLtPlan {
+  hipblasLtMatmulDesc_t desc = nullptr;
+  hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
+  hipblasLtMatmulAlgo_t algo{};
+  bool valid = false;
+};
+#endif
 struct Blas {
+#ifdef RWKV_USE_HIP
+  hipblasHandle_t h = nullptr;
+  hipblasLtHandle_t lt = nullptr;
+  rwkv_bf16_training::DeviceBuffer<uint8_t> ws;
+  std::map<std::tuple<int, int, int, int, int, bool, bool, bool>, NoraHipLtPlan> lt_cache;
+#else
   cublasHandle_t h = nullptr;
   rwkv_bf16_training::DeviceBuffer<uint8_t> ws;
+#endif
   rwkv_bf16_training::DeviceBuffer<float> latent, grad_pair;
   rwkv_bf16_training::DeviceBuffer<bf16> pair, twice;
   Blas() {
+#ifdef RWKV_USE_HIP
+    if (hipblasCreate(&h) != HIPBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("NoRA hipblasCreate");
+    if (hipblasLtCreate(&lt) != HIPBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("NoRA hipblasLtCreate");
+    ws.resize(32 * 1024 * 1024, "NoRA hipBLASLt workspace");
+#else
     if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS)
       throw std::runtime_error("NoRA cublasCreate");
     ws.resize(32 * 1024 * 1024, "NoRA cuBLAS workspace");
     if (cublasSetWorkspace(h, ws.p, ws.n) != CUBLAS_STATUS_SUCCESS)
       throw std::runtime_error("NoRA cublasSetWorkspace");
+#endif
   }
-  ~Blas() { cublasDestroy(h); }
+  ~Blas() {
+#ifdef RWKV_USE_HIP
+    for (auto &kv : lt_cache) {
+      if (kv.second.lc) hipblasLtMatrixLayoutDestroy(kv.second.lc);
+      if (kv.second.lb) hipblasLtMatrixLayoutDestroy(kv.second.lb);
+      if (kv.second.la) hipblasLtMatrixLayoutDestroy(kv.second.la);
+      if (kv.second.desc) hipblasLtMatmulDescDestroy(kv.second.desc);
+    }
+    if (lt) hipblasLtDestroy(lt);
+    if (h) hipblasDestroy(h);
+#else
+    if (h) cublasDestroy(h);
+#endif
+  }
   cudaStream_t last_stream = reinterpret_cast<cudaStream_t>(~uintptr_t(0));
   template <class T>
   T *grow(rwkv_bf16_training::DeviceBuffer<T> &b, size_t n) {
@@ -91,9 +132,14 @@ struct Blas {
 Blas &blas(cudaStream_t stream) {
   static thread_local Blas b;
   if (b.last_stream != stream) {
+#ifdef RWKV_USE_HIP
+    if (hipblasSetStream(b.h, stream) != HIPBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("NoRA hipblasSetStream");
+#else
     if (cublasSetStream(b.h, stream) != CUBLAS_STATUS_SUCCESS ||
         cublasSetWorkspace(b.h, b.ws.p, b.ws.n) != CUBLAS_STATUS_SUCCESS)
       throw std::runtime_error("NoRA cublasSetStream/Workspace");
+#endif
     b.last_stream = stream;
   }
   return b;
@@ -104,18 +150,70 @@ bool tensor_cores(const rwkv_bf16_miss::Linear &w) {
          (w.rank & 7) == 0;
 }
 // Row-major C[M,N] = alpha op(A)[M,K] op(B)[K,N] + beta C (leading dimensions
-// lda, ldb in elements), on column-major cuBLAS as C^T = op(B)^T op(A)^T.
+// lda, ldb in elements), on column-major BLAS as C^T = op(B)^T op(A)^T.
 template <class C>
-void product(cublasHandle_t h, bool ta, bool tb, int M, int N, int K,
+void product(cudaStream_t stream, Blas &bl,
+             bool ta, bool tb, int M, int N, int K,
              float alpha, const bf16 *a, int lda, const bf16 *b, int ldb,
              float beta, C *c) {
+#ifdef RWKV_USE_HIP
+  constexpr bool out_f32 = std::is_same_v<C, float>;
+  if (M >= 64 && N >= 64 && K >= 64 && (M & 7) == 0 && (N & 7) == 0 &&
+      (K & 7) == 0 && ((reinterpret_cast<uintptr_t>(a) |
+                        reinterpret_cast<uintptr_t>(b) |
+                        reinterpret_cast<uintptr_t>(c)) & 15u) == 0) {
+    auto key = std::make_tuple(M, N, K, lda, ldb, ta, tb, out_f32);
+    auto [it, fresh] = bl.lt_cache.try_emplace(key);
+    NoraHipLtPlan &plan = it->second;
+    if (fresh) {
+      hipblasLtMatmulPreference_t pref = nullptr;
+      const hipblasOperation_t op_b = tb ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+      const hipblasOperation_t op_a = ta ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+      const hipDataType c_type = out_f32 ? HIP_R_32F : HIP_R_16BF;
+      const size_t ws_bytes = bl.ws.n;
+      hipblasLtMatmulHeuristicResult_t res{};
+      int found = 0;
+      const uint64_t b_rows = tb ? K : N, b_cols = tb ? N : K;
+      const uint64_t a_rows = ta ? M : K, a_cols = ta ? K : M;
+      if (hipblasLtMatmulDescCreate(&plan.desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) == HIPBLAS_STATUS_SUCCESS &&
+          hipblasLtMatmulDescSetAttribute(plan.desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_b, sizeof(op_b)) == HIPBLAS_STATUS_SUCCESS &&
+          hipblasLtMatmulDescSetAttribute(plan.desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_a, sizeof(op_a)) == HIPBLAS_STATUS_SUCCESS &&
+          hipblasLtMatrixLayoutCreate(&plan.la, HIP_R_16BF, b_rows, b_cols, ldb) == HIPBLAS_STATUS_SUCCESS &&
+          hipblasLtMatrixLayoutCreate(&plan.lb, HIP_R_16BF, a_rows, a_cols, lda) == HIPBLAS_STATUS_SUCCESS &&
+          hipblasLtMatrixLayoutCreate(&plan.lc, c_type, N, M, N) == HIPBLAS_STATUS_SUCCESS &&
+          hipblasLtMatmulPreferenceCreate(&pref) == HIPBLAS_STATUS_SUCCESS &&
+          hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_bytes, sizeof(ws_bytes)) == HIPBLAS_STATUS_SUCCESS &&
+          hipblasLtMatmulAlgoGetHeuristic(bl.lt, plan.desc, plan.la, plan.lb, plan.lc, plan.lc, pref, 1, &res, &found) == HIPBLAS_STATUS_SUCCESS &&
+          found > 0) {
+        plan.algo = res.algo;
+        plan.valid = true;
+      }
+      if (pref) hipblasLtMatmulPreferenceDestroy(pref);
+    }
+    if (plan.valid &&
+        hipblasLtMatmul(bl.lt, plan.desc, &alpha, b, plan.la, a, plan.lb, &beta,
+                        c, plan.lc, c, plan.lc, &plan.algo, bl.ws.p, bl.ws.n,
+                        stream) == HIPBLAS_STATUS_SUCCESS) {
+      return;
+    }
+  }
+  const auto type = out_f32 ? HIPBLAS_R_32F : HIPBLAS_R_16B;
+  if (hipblasGemmEx(bl.h, tb ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+                    ta ? HIPBLAS_OP_T : HIPBLAS_OP_N, N, M, K, &alpha, b,
+                    HIPBLAS_R_16B, ldb, a, HIPBLAS_R_16B, lda, &beta, c, type, N,
+                    HIPBLAS_COMPUTE_32F,
+                    HIPBLAS_GEMM_DEFAULT) != HIPBLAS_STATUS_SUCCESS)
+    throw std::runtime_error("NoRA hipblasGemmEx");
+#else
+  (void)stream;
   const auto type = std::is_same_v<C, float> ? CUDA_R_32F : CUDA_R_16BF;
-  if (cublasGemmEx(h, tb ? CUBLAS_OP_T : CUBLAS_OP_N,
+  if (cublasGemmEx(bl.h, tb ? CUBLAS_OP_T : CUBLAS_OP_N,
                    ta ? CUBLAS_OP_T : CUBLAS_OP_N, N, M, K, &alpha, b,
                    CUDA_R_16BF, ldb, a, CUDA_R_16BF, lda, &beta, c, type, N,
                    CUBLAS_COMPUTE_32F,
                    CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS)
     throw std::runtime_error("NoRA cublasGemmEx");
+#endif
 }
 // [hi|lo] rows x 2*rank.
 const bf16 *pair(cudaStream_t stream, Blas &b, const float *x, int rows,
@@ -142,12 +240,12 @@ void forward_tensor(cudaStream_t stream, int rows,
   const int r = w.rank;
   if (!s)
     s = b.grow(b.latent, size_t(rows) * r);
-  product(b.h, false, true, rows, r, w.in, 1.f, x, w.in, w.a, w.in, 0.f, s);
+  product(stream, b, false, true, rows, r, w.in, 1.f, x, w.in, w.a, w.in, 0.f, s);
   if (!y)
     return;
   const bf16 *d_rep =
       w.d_twice ? w.d_twice : twice(stream, b, w.d, w.out, r, true);
-  product(b.h, false, true, rows, w.out, 2 * r, w.scale,
+  product(stream, b, false, true, rows, w.out, 2 * r, w.scale,
           pair(stream, b, s, rows, r), 2 * r, d_rep, 2 * r, 1.f, y);
 }
 // dB += scale g^T s; ds = scale g B; dA += ds^T x; dx += ds A.
@@ -159,18 +257,18 @@ void backward_tensor(cudaStream_t stream, int rows,
   if (w.gradient) {
     const bf16 *sp = pair(stream, b, s, rows, r);
     float *gp = b.grow(b.grad_pair, size_t(w.out) * 2 * r);
-    product(b.h, true, false, w.out, 2 * r, rows, w.scale, g, w.out, sp, 2 * r,
+    product(stream, b, true, false, w.out, 2 * r, rows, w.scale, g, w.out, sp, 2 * r,
             0.f, gp);
     const size_t total_b = size_t(w.out) * r;
     accum_grad_b_pair<<<(total_b + 255) / 256, 256, 0, stream>>>(
         w.out, r, gp, w.gradient);
   }
-  product(b.h, false, false, rows, r, w.out, w.scale, g, w.out, w.d, r, 0.f,
+  product(stream, b, false, false, rows, r, w.out, w.scale, g, w.out, w.d, r, 0.f,
           ds);
   const bf16 *dp = pair(stream, b, ds, rows, r);
   if (w.gradient_a) {
     float *gp = b.grow(b.grad_pair, 2 * size_t(r) * w.in);
-    product(b.h, true, false, 2 * r, w.in, rows, 1.f, dp, 2 * r, x, w.in, 0.f,
+    product(stream, b, true, false, 2 * r, w.in, rows, 1.f, dp, 2 * r, x, w.in, 0.f,
             gp);
     const size_t total_a = size_t(r) * w.in;
     accum_grad_a_pair<<<(total_a + 255) / 256, 256, 0, stream>>>(
@@ -179,11 +277,10 @@ void backward_tensor(cudaStream_t stream, int rows,
   if (dx) {
     const bf16 *a_rep =
         w.a_twice ? w.a_twice : twice(stream, b, w.a, r, w.in, false);
-    product(b.h, false, false, rows, w.in, 2 * r, 1.f, dp, 2 * r, a_rep, w.in,
+    product(stream, b, false, false, rows, w.in, 2 * r, 1.f, dp, 2 * r, a_rep, w.in,
             1.f, dx);
   }
 }
-#endif
 __global__ void replay_mix(int lanes, int time, int C, int rows,
                            const int *offsets, const std::uint8_t *doc_start,
                            const bf16 *x, const bf16 *shift, const bf16 *mix,
@@ -207,13 +304,11 @@ void forward(cudaStream_t stream, int rows, const rwkv_bf16_miss::Linear &w,
   if (!x || (!y && !s))
     throw std::invalid_argument("null NoRA forward input");
   using namespace rwkv_nora_detail;
-#ifndef RWKV_USE_HIP
   if (tensor_cores(w)) {
     forward_tensor(stream, rows, w, x, y, s);
     checked();
     return;
   }
-#endif
   if (s) {
     detail::projection<true>(stream, rows, w.rank, w.in, x, w.a, s);
     if (y)
@@ -231,13 +326,11 @@ void backward(cudaStream_t stream, int rows, const rwkv_bf16_miss::Linear &w,
   if (!g || !ds || (w.gradient && !s) || (w.gradient_a && !x))
     throw std::invalid_argument("null NoRA backward input/tape");
   using namespace rwkv_nora_detail;
-#ifndef RWKV_USE_HIP
   if (tensor_cores(w)) {
     backward_tensor(stream, rows, w, x, s, g, dx, ds);
     checked();
     return;
   }
-#endif
   if (w.gradient)
     detail::grad_weight(stream, w.out, w.rank, rows, g, s, w.gradient, w.scale);
   detail::projection<false>(stream, rows, w.rank, w.out, g, w.d, ds, w.scale);
@@ -251,15 +344,10 @@ void refresh_weight_twice(cudaStream_t stream, int rows, int cols, bool side,
                           const bf16 *src, bf16 *dst) {
   if (!src || !dst || rows < 1 || cols < 1)
     throw std::invalid_argument("invalid NoRA repeated weight buffer");
-#ifndef RWKV_USE_HIP
   const size_t total = 2 * size_t(rows) * cols;
   repeat_weight_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
       total, rows, cols, side, src, dst);
   checked();
-#else
-  (void)stream;
-  (void)side;
-#endif
 }
 void backward_target(cudaStream_t stream,
                      const rwkv_bf16_training::FrozenBlockWeights &w,

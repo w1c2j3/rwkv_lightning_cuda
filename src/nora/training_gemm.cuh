@@ -4,7 +4,6 @@
 
 namespace rwkv_bf16_nora {
 namespace detail {
-#ifndef RWKV_USE_HIP
 // A warp owns one latent coordinate. Unlike a 16x16 output tile, this
 // exposes many CTAs even for [512,16] projections. The reduction tree does
 // not depend on the number of packed rows; all arithmetic stays FP32.
@@ -184,18 +183,14 @@ __global__ void grad_a_16(int m, int n, int rows, const L *left, const R *right,
     }
   }
 }
-#endif
-
 template <class L, class R>
 void grad_weight(cudaStream_t stream, int m, int n, int rows, const L *left,
                  const R *right, float *out, float scale = 1) {
-#ifndef RWKV_USE_HIP
   if (m >= 8192 && (n & 15) == 0) {
     grad_b_16<<<dim3((n + 15) / 16, (m + 63) / 64), 128, 0, stream>>>(
         m, n, rows, left, right, out, scale);
     return;
   }
-#endif
   rwkv_nora_detail::gemm<true, false, true>(stream, m, n, rows, left, right,
                                             out, scale);
 }
@@ -204,7 +199,6 @@ template <bool TR>
 void projection(cudaStream_t stream, int rows, int rank, int width,
                 const bf16 *x, const bf16 *weight, float *out,
                 float scale = 1) {
-#ifndef RWKV_USE_HIP
   if (width >= 256) {
     if constexpr (TR) {
       if (rank <= 32) {
@@ -218,21 +212,18 @@ void projection(cudaStream_t stream, int rows, int rank, int width,
       return;
     }
   }
-#endif
   rwkv_nora_detail::gemm<false, TR, false>(stream, rows, rank, width, x, weight,
                                            out, scale);
 }
 template <bool TR>
 void expansion(cudaStream_t stream, int rows, int cols, int rank,
                const float *x, const bf16 *weight, bf16 *out, float scale = 1) {
-#ifndef RWKV_USE_HIP
   if (rank == 16) {
     expand<TR, 16>
         <<<dim3((cols + 63) / 64, (rows + 15) / 16), 128, 0, stream>>>(
             rows, cols, x, weight, out, scale);
     return;
   }
-#endif
   rwkv_nora_detail::gemm<false, TR, true>(stream, rows, cols, rank, x, weight,
                                           out, scale);
 }

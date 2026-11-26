@@ -14,6 +14,49 @@ constexpr int kN = 64;
 constexpr int kThreads = 256;
 constexpr float kLnEps = 1.0e-5f;
 
+#ifdef RWKV_USE_HIP
+struct Bf16x8Fwd { bf16 v[8]; };
+__device__ __forceinline__ Bf16x8Fwd ld8_f(const bf16 *p) {
+  union { uint4 u; Bf16x8Fwd b; } r;
+  r.u = *reinterpret_cast<const uint4 *>(p);
+  return r.b;
+}
+__device__ __forceinline__ void st8_f(bf16 *p, Bf16x8Fwd b) {
+  union { uint4 u; Bf16x8Fwd b; } r;
+  r.b = b;
+  *reinterpret_cast<uint4 *>(p) = r.u;
+}
+static inline bool aligned16_f(const void *p) {
+  return (reinterpret_cast<uintptr_t>(p) & 15u) == 0;
+}
+__global__ void
+vres_forward_kernel_v8(int C8, const bf16 *__restrict__ base,
+                       const bf16 *__restrict__ first,
+                       const bf16 *__restrict__ v0,
+                       const bf16 *__restrict__ v12, bf16 *__restrict__ gate,
+                       bf16 *__restrict__ out, std::size_t n8) {
+  const std::size_t i8 =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i8 >= n8)
+    return;
+  const int c8 = static_cast<int>(i8 % C8);
+  const Bf16x8Fwd bv = ld8_f(base + i8 * 8);
+  const Bf16x8Fwd fv = ld8_f(first + i8 * 8);
+  const Bf16x8Fwd v0v = ld8_f(v0 + c8 * 8);
+  const Bf16x8Fwd v12v = ld8_f(v12 + i8 * 8);
+  Bf16x8Fwd gv, ov;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    const float x = to_float(v0v.v[k]) + to_float(v12v.v[k]);
+    const float g = 1.0f / (1.0f + expf(-x));
+    const float b = to_float(bv.v[k]);
+    gv.v[k] = to_bf16(g);
+    ov.v[k] = to_bf16(b + (to_float(fv.v[k]) - b) * g);
+  }
+  st8_f(gate + i8 * 8, gv);
+  st8_f(out + i8 * 8, ov);
+}
+#endif
 __global__ void
 vres_forward_kernel(int C, const bf16 *__restrict__ base,
                     const bf16 *__restrict__ first, const bf16 *__restrict__ v0,
@@ -225,6 +268,14 @@ void block_forward_state_tuning_bf16(
     bf16 *v1 = arena.take(static_cast<std::size_t>(rows) * w.rank_v);
     rwkv7_v3a_linear_bf16_launch(stream, rows, C, w.rank_v, xv, w.v1, v1);
     rwkv7_v3a_linear_bf16_launch(stream, rows, w.rank_v, C, v1, w.v2, v12);
+#ifdef RWKV_USE_HIP
+    if ((C & 7) == 0 && (R & 7) == 0 && aligned16_f(tape.v_base) &&
+        aligned16_f(v_first) && aligned16_f(w.v0) && aligned16_f(v12) &&
+        aligned16_f(tape.v_gate) && aligned16_f(tape.v)) {
+      vres_forward_kernel_v8<<<blocks(R >> 3), kThreads, 0, stream>>>(
+          C >> 3, tape.v_base, v_first, w.v0, v12, tape.v_gate, tape.v, R >> 3);
+    } else
+#endif
     vres_forward_kernel<<<blocks(R), kThreads, 0, stream>>>(
         C, tape.v_base, v_first, w.v0, v12, tape.v_gate, tape.v, R);
   }

@@ -5,6 +5,7 @@
 
 #include <cfloat>
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 
 namespace rwkv_bf16_training {
@@ -84,6 +85,172 @@ __global__ void xent_kernel(int vocab, const bf16 *__restrict__ logits,
                         scale);
   }
 }
+
+#ifdef RWKV_USE_HIP
+struct alignas(16) Bf16x8Tk {
+  bf16 v[8];
+};
+__device__ __forceinline__ Bf16x8Tk ld8_tk(const bf16 *p) {
+  Bf16x8Tk out;
+  *reinterpret_cast<uint4 *>(&out) = *reinterpret_cast<const uint4 *>(p);
+  return out;
+}
+__device__ __forceinline__ void st8_tk(bf16 *p, Bf16x8Tk val) {
+  *reinterpret_cast<uint4 *>(p) = *reinterpret_cast<const uint4 *>(&val);
+}
+static inline bool aligned16_tk(const void *p) {
+  return (reinterpret_cast<std::uintptr_t>(p) & 15) == 0;
+}
+
+__device__ __forceinline__ float block_reduce_hip(float value, float *scratch,
+                                                  bool maximum) {
+#if defined(__GFX8__) || defined(__GFX9__)
+  __syncthreads();
+#pragma unroll
+  for (int offset = 32; offset > 0; offset >>= 1) {
+    const float other = __shfl_down(value, offset, 64);
+    value = maximum ? fmaxf(value, other) : (value + other);
+  }
+  const int lane = threadIdx.x & 63;
+  const int wave = threadIdx.x >> 6;
+  if (lane == 0)
+    scratch[wave] = value;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float v = scratch[0];
+    v = maximum ? fmaxf(v, scratch[1]) : (v + scratch[1]);
+    v = maximum ? fmaxf(v, scratch[2]) : (v + scratch[2]);
+    v = maximum ? fmaxf(v, scratch[3]) : (v + scratch[3]);
+    scratch[0] = v;
+  }
+  __syncthreads();
+  return scratch[0];
+#else
+  return block_reduce(value, scratch, maximum);
+#endif
+}
+
+__global__ __launch_bounds__(kThreads) void xent_kernel_v8(
+    int vocab, const bf16 *__restrict__ logits,
+    const int *__restrict__ targets, int ignore_index, float scale,
+    float *__restrict__ loss, bf16 *__restrict__ d_logits,
+    const float *row_weights, float temperature) {
+  const int row = blockIdx.x;
+  const int target = targets[row];
+  scale *= row_weights ? row_weights[row] : 1.0f;
+  const long long base = static_cast<long long>(row) * vocab;
+  const int vocab8 = vocab >> 3;
+  const bool unit_temp = (temperature == 1.0f);
+  const bool ignored = (target == ignore_index || scale == 0.0f);
+  __shared__ float scratch[8];
+
+  if (ignored) {
+    if (d_logits == logits)
+      __syncthreads();
+    Bf16x8Tk zeros;
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+      zeros.v[k] = to_bf16(0.0f);
+    for (int t8 = threadIdx.x; t8 < vocab8; t8 += blockDim.x)
+      st8_tk(d_logits + base + (static_cast<long long>(t8) << 3), zeros);
+    return;
+  }
+
+  float local_max = -FLT_MAX;
+  for (int t8 = threadIdx.x; t8 < vocab8; t8 += blockDim.x) {
+    const Bf16x8Tk v = ld8_tk(logits + base + (static_cast<long long>(t8) << 3));
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      float lv = to_float(v.v[k]);
+      if (!unit_temp)
+        lv /= temperature;
+      local_max = fmaxf(local_max, lv);
+    }
+  }
+  const float max_logit = block_reduce_hip(local_max, scratch, true);
+
+  float local_sum = 0.0f;
+  for (int t8 = threadIdx.x; t8 < vocab8; t8 += blockDim.x) {
+    const Bf16x8Tk v = ld8_tk(logits + base + (static_cast<long long>(t8) << 3));
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      float lv = to_float(v.v[k]);
+      if (!unit_temp)
+        lv /= temperature;
+      local_sum += expf(lv - max_logit);
+    }
+  }
+  const float sum = block_reduce_hip(local_sum, scratch, false);
+  const float inv_sum = 1.0f / sum;
+  const float target_logit = to_float(logits[base + target]);
+  if (d_logits == logits)
+    __syncthreads();
+
+  for (int t8 = threadIdx.x; t8 < vocab8; t8 += blockDim.x) {
+    const long long tok_base = static_cast<long long>(t8) << 3;
+    const Bf16x8Tk v = ld8_tk(logits + base + tok_base);
+    Bf16x8Tk out;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      float lv = to_float(v.v[k]);
+      if (!unit_temp)
+        lv /= temperature;
+      const float prob = expf(lv - max_logit) * inv_sum;
+      const int tok = static_cast<int>(tok_base) + k;
+      float g = (prob - (tok == target ? 1.0f : 0.0f)) * scale;
+      if (!unit_temp)
+        g /= temperature;
+      out.v[k] = to_bf16(g);
+    }
+    st8_tk(d_logits + base + tok_base, out);
+  }
+  if (threadIdx.x == 0) {
+    const float t_scaled = unit_temp ? target_logit : (target_logit / temperature);
+    atomicAdd(loss, (logf(sum) + max_logit - t_scaled) * scale);
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void target_logprob_kernel_v8(
+    int vocab, const bf16 *__restrict__ logits,
+    const int *__restrict__ targets, float *__restrict__ out,
+    float temperature) {
+  const int row = blockIdx.x;
+  const long long base = static_cast<long long>(row) * vocab;
+  const int vocab8 = vocab >> 3;
+  const bool unit_temp = (temperature == 1.0f);
+  __shared__ float scratch[8];
+
+  float local_max = -FLT_MAX;
+  for (int t8 = threadIdx.x; t8 < vocab8; t8 += blockDim.x) {
+    const Bf16x8Tk v = ld8_tk(logits + base + (static_cast<long long>(t8) << 3));
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      float lv = to_float(v.v[k]);
+      if (!unit_temp)
+        lv /= temperature;
+      local_max = fmaxf(local_max, lv);
+    }
+  }
+  const float max_logit = block_reduce_hip(local_max, scratch, true);
+
+  float local_sum = 0.0f;
+  for (int t8 = threadIdx.x; t8 < vocab8; t8 += blockDim.x) {
+    const Bf16x8Tk v = ld8_tk(logits + base + (static_cast<long long>(t8) << 3));
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      float lv = to_float(v.v[k]);
+      if (!unit_temp)
+        lv /= temperature;
+      local_sum += expf(lv - max_logit);
+    }
+  }
+  const float sum = block_reduce_hip(local_sum, scratch, false);
+  if (threadIdx.x == 0) {
+    const float tl = to_float(logits[base + targets[row]]);
+    out[row] = (unit_temp ? tl : (tl / temperature)) - max_logit - logf(sum);
+  }
+}
+#endif
 
 __global__ void gradient_norm_check_kernel(const float *__restrict__ grad,
                                            std::size_t elements,
@@ -279,6 +446,14 @@ void cross_entropy_forward_backward_bf16(cudaStream_t stream, int rows,
     if (error != cudaSuccess)
       throw std::runtime_error(cudaGetErrorString(error));
   }
+#ifdef RWKV_USE_HIP
+  if ((vocab & 7) == 0 && aligned16_tk(logits) && aligned16_tk(d_logits)) {
+    xent_kernel_v8<<<rows, kThreads, 0, stream>>>(
+        vocab, logits, targets, ignore_index, gradient_scale / rows, loss,
+        d_logits, row_weights, temperature);
+    return;
+  }
+#endif
   xent_kernel<<<rows, kThreads, 0, stream>>>(
       vocab, logits, targets, ignore_index, gradient_scale / rows, loss,
       d_logits, row_weights, temperature);
@@ -306,6 +481,13 @@ void target_logprobs_bf16(cudaStream_t stream, int rows, int vocab,
       !std::isfinite(temperature) || temperature <= 0) {
     throw std::invalid_argument("invalid target log-probability arguments");
   }
+#ifdef RWKV_USE_HIP
+  if ((vocab & 7) == 0 && aligned16_tk(logits)) {
+    target_logprob_kernel_v8<<<rows, kThreads, 0, stream>>>(
+        vocab, logits, targets, out, temperature);
+    return;
+  }
+#endif
   target_logprob_kernel<<<rows, kThreads, 0, stream>>>(vocab, logits, targets,
                                                        out, temperature);
 }

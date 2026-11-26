@@ -13,20 +13,25 @@ int main() {
   using namespace rwkv7_state_tuning;
   try {
     const WkvShape shape{2, 7, 3, 64};
-    // 14 rows: one checkpoint slot per lane, plus [B,H,interval] scratch.
+    const std::size_t dense_slots =
+        (std::size_t(2 * 7) + kWkvCheckpointInterval - 1) /
+            kWkvCheckpointInterval +
+        1;
     const std::size_t expected =
-        static_cast<std::size_t>(2 * 3 + 2 * 3 * kWkvCheckpointInterval) *
+        (dense_slots * 3 + std::size_t(2 * 3) * kWkvCheckpointInterval) *
         64 * 64;
     if (wkv_tape_elements(shape) != expected) {
       throw std::runtime_error("unexpected exact WKV tape size");
     }
     const int fake_offsets[1] = {};
-    // 40 packed rows over 3 lanes: ceil(40/16) slots plus one per extra lane.
+    const std::size_t packed_slots =
+        (std::size_t(40) + kWkvCheckpointInterval - 1) /
+            kWkvCheckpointInterval +
+        2;
     const WkvShape packed{3, 40, 2, 64, fake_offsets};
-    if (wkv_checkpoint_elements(packed) != static_cast<std::size_t>(5 * 2) *
-                                               64 * 64 ||
+    if (wkv_checkpoint_elements(packed) != packed_slots * 2 * 64 * 64 ||
         wkv_tape_elements(packed) !=
-            static_cast<std::size_t>(5 * 2 + 3 * 2 * kWkvCheckpointInterval) *
+            (packed_slots * 2 + std::size_t(3 * 2) * kWkvCheckpointInterval) *
                 64 * 64) {
       throw std::runtime_error("unexpected packed WKV tape size");
     }

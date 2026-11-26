@@ -133,8 +133,16 @@ DeviceHwInfo query_device_hw(int heads) {
             cudaSuccess ||
         l2 <= 0)
       l2 = 40 * 1024 * 1024;
+#ifdef RWKV_USE_HIP
+    // HIP exact_backward_kernel_w4 skips history traffic on block endpoints.
+    const size_t active_hist_steps =
+        size_t(std::max(1, rwkv7_state_tuning::kWkvCheckpointInterval - 2));
+    const size_t per_lane =
+        size_t(heads) * active_hist_steps * 64 * 64 * 4;
+#else
     const size_t per_lane =
         size_t(heads) * rwkv7_state_tuning::kWkvCheckpointInterval * 64 * 64 * 4;
+#endif
     const size_t budget = (size_t(l2) * 7) / 8;
     const int max_lanes =
         std::clamp(int(budget / (per_lane ? per_lane : 1)), 2, 16);
@@ -150,6 +158,10 @@ int wkv_sm_waves(int lanes, int heads, const DeviceHwInfo &hw) {
   auto waves_of = [&](int b) {
     return (b * heads + hw.sm_count - 1) / hw.sm_count;
   };
+#ifdef RWKV_USE_HIP
+  // HIP WKV backward launches all active lanes in a single dim3(heads, lanes) grid.
+  return waves_of(lanes);
+#else
   if (lanes <= hw.max_l2_lanes)
     return waves_of(lanes);
   constexpr int kMaxB = 64;
@@ -167,6 +179,7 @@ int wkv_sm_waves(int lanes, int heads, const DeviceHwInfo &hw) {
   const int full = lanes / hw.max_l2_lanes;
   const int rem = lanes % hw.max_l2_lanes;
   return full * waves_of(hw.max_l2_lanes) + (rem ? waves_of(rem) : 0);
+#endif
 }
 
 } // namespace
@@ -1054,6 +1067,11 @@ void Executor::reserve_sequence(int tokens) {
   const size_t est_rows =
       std::min<size_t>(size_t(tokens) * size_t(impl_->B), 262144);
   impl_->ensure_window_pool(typ_chunks, est_rows);
+}
+size_t Executor::stride1_row_capacity() const {
+  const auto &w = *impl_;
+  const size_t slots_s1 = size_t(std::max(1, w.L - 1));
+  return std::min(w.win_dout_cap, w.win_slot_rows / slots_s1);
 }
 float Executor::backward(const FrozenModelView &m,
                          const std::vector<int> &tokens,

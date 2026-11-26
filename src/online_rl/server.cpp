@@ -243,7 +243,8 @@ Options parse(int argc, char **argv, bool miss, bool nora) {
       int64_t(o.chunk) * o.micro_bsz > 65535 || o.cache < 0 || o.versions < 1 ||
       o.cache_memory_mb < 0 || o.cache_memory_mb > 1048576 ||
       o.versions > 32 || o.rank < 1 || o.rank > 1024 ||
-      (o.gemm_mode != "bf16" && o.gemm_mode != "strict") ||
+      (o.gemm_mode != "bf16" && o.gemm_mode != "strict" &&
+       o.gemm_mode != "auto") ||
       o.max_tokens < 1 || o.max_tokens > 1048576)
     throw std::invalid_argument(
         "invalid model/port/chunk/ctx/batch/micro-bsz/cache/cache-memory-mb/versions/rank/gemm-mode/max-tokens");
@@ -759,10 +760,14 @@ public:
     r["wkv_state_dtype"] = "float32";
     r["gemm_mode"] = o_.gemm_mode;
 #ifdef RWKV_USE_HIP
-    r["gemm_tile_rows"] = 32;
+    if (o_.gemm_mode == "strict")
+      r["gemm_tile_rows"] = 32;
+    else if (o_.gemm_mode == "bf16")
+      r["gemm_pinned_rows"] = 64;
 #else
     // One pinned cuBLASLt kernel per shape, chosen for 64-row GEMMs.
-    r["gemm_pinned_rows"] = 64;
+    if (o_.gemm_mode != "auto")
+      r["gemm_pinned_rows"] = 64;
 #endif
     r["backbone_loads"] = 1;
     r["step"] = Json::UInt64(step_);
@@ -1325,12 +1330,14 @@ class Worker {
   std::thread thread_;
 
 public:
-  explicit Worker(bool strict) {
+  explicit Worker(const std::string &gemm_mode) {
     int dev = 0;
     gpu_check(cudaGetDevice(&dev), "Worker query device");
-    thread_ = std::thread([this, strict, dev] {
+    const bool consistent = gemm_mode != "auto";
+    const bool tensor_cores = gemm_mode == "bf16";
+    thread_ = std::thread([this, consistent, tensor_cores, dev] {
       gpu_check(cudaSetDevice(dev), "Worker bind device");
-      set_consistent_forward(true, !strict);
+      set_consistent_forward(consistent, tensor_cores);
       for (;;) {
         std::function<void()> job;
         {
@@ -1462,7 +1469,7 @@ int run(int argc, char **argv, bool miss, bool nora) {
 #else
     Runtime runtime(o, miss, nora);
 #endif
-    Worker worker(o.gemm_mode == "strict");
+    Worker worker(o.gemm_mode);
 
     int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0)
@@ -1658,7 +1665,7 @@ int run(int argc, char **argv, bool miss, bool nora) {
     return 0;
 #else
     Runtime runtime(o, miss, nora);
-    Worker worker(o.gemm_mode == "strict");
+    Worker worker(o.gemm_mode);
     auto route = [&](const std::string &path, drogon::HttpMethod method,
                      auto action) {
       drogon::app().registerHandler(

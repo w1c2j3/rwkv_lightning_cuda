@@ -43,7 +43,7 @@ target_include_directories(rwkv_bf16_training
 target_link_libraries(rwkv_bf16_training PUBLIC ${RWKV_JSON_TARGET} OpenSSL::Crypto)
 if(RWKV_GPU_BACKEND STREQUAL "HIP")
   target_compile_definitions(rwkv_bf16_training PUBLIC RWKV_USE_HIP)
-  target_link_libraries(rwkv_bf16_training PUBLIC hip::host roc::hipblas)
+  target_link_libraries(rwkv_bf16_training PUBLIC hip::host roc::hipblas roc::hipblaslt)
 else()
   target_link_libraries(rwkv_bf16_training PUBLIC CUDA::cublas CUDA::cublasLt CUDA::cudart)
   set_property(TARGET rwkv_bf16_training PROPERTY CUDA_RUNTIME_LIBRARY Shared)

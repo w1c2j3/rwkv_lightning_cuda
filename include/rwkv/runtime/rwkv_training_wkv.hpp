@@ -29,7 +29,13 @@ struct WkvShape {
 // replays the rows in between with the forward's arithmetic, so gradients
 // match a full per-row tape bitwise. A trailing [B,H,interval,K,V] region is
 // the backward's replay scratch.
+#ifdef RWKV_USE_HIP
+// CDNA2/3 L2 (8 MB/GCD on MI250) holds 104 CUs x 2 active replay states x 16 KB
+// = 3.3 MB at interval=4, keeping replay history L2-resident with exact FP32.
+constexpr int kWkvCheckpointInterval = 4;
+#else
 constexpr int kWkvCheckpointInterval = 16;
+#endif
 
 struct WkvTapeView {
   float *data = nullptr;

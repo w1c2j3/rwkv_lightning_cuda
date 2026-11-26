@@ -71,6 +71,24 @@ __host__ __device__ inline LaneRow lane_row(const int *offsets, int lanes,
   }
   return {lo, offsets[lo] == row, offsets[lo + 1] == row + 1};
 }
+#ifdef RWKV_USE_HIP
+inline bool is_wave64_device() {
+  static thread_local int cached_dev = -1;
+  static thread_local bool cached_w64 = false;
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess)
+    return false;
+  if (dev != cached_dev) {
+    int ws = 32;
+    if (hipDeviceGetAttribute(&ws, hipDeviceAttributeWarpSize, dev) !=
+        hipSuccess)
+      ws = 32;
+    cached_dev = dev;
+    cached_w64 = (ws == 64);
+  }
+  return cached_w64;
+}
+#endif
 inline void gpu_check(cudaError_t e, const char *what) {
   if (e != cudaSuccess)
     throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));

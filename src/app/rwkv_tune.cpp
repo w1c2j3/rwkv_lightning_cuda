@@ -601,20 +601,105 @@ int main(int argc, char **argv) {
 #endif
 #endif
         float batch_loss = 0.0f;
-        const std::size_t step_bsz =
+        std::vector<std::vector<std::size_t>> micro_groups;
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
-            (!rwkv_bf16_training::consistent_forward_enabled() && micro_bsz > 1)
-                ? std::max<std::size_t>(
-                      1, std::min<std::size_t>(
-                             batch.size(),
-                             static_cast<std::size_t>(micro_bsz) * 2))
-                : static_cast<std::size_t>(micro_bsz);
+        const std::size_t cap_s1 = executor.stride1_row_capacity();
+        if (micro_bsz == 1) {
+          micro_groups.reserve(batch.size());
+          for (std::size_t i = 0; i < batch.size(); ++i)
+            micro_groups.push_back({i});
+        } else if (!rwkv_bf16_training::consistent_forward_enabled()) {
+          // Partition local samples into balanced LPT micro-batches that each
+          // fit within the executor's stride=1 layer-input cache, avoiding
+          // stride=2 redundant ffn_value recomputation while keeping all lanes full.
+          const std::size_t max_per_group = std::max<std::size_t>(
+              1, static_cast<std::size_t>(micro_bsz) * 2);
+          std::vector<std::size_t> order(batch.size());
+          std::size_t total_rows = 0;
+          for (std::size_t i = 0; i < batch.size(); ++i) {
+            order[i] = i;
+            total_rows += batch[i].tokens.size() - 1;
+          }
+          std::stable_sort(order.begin(), order.end(),
+                           [&](std::size_t a, std::size_t b) {
+                             return batch[a].tokens.size() >
+                                    batch[b].tokens.size();
+                           });
+          std::size_t num_groups =
+              (batch.size() + max_per_group - 1) / max_per_group;
+          if (cap_s1 > 0 && total_rows > cap_s1) {
+            num_groups = std::max(
+                num_groups, (total_rows + cap_s1 - 1) / cap_s1);
+          }
+          num_groups = std::min(num_groups, batch.size());
+          for (; num_groups <= batch.size(); ++num_groups) {
+            std::vector<std::vector<std::size_t>> cand(num_groups);
+            std::vector<std::size_t> cand_rows(num_groups, 0);
+            for (const std::size_t idx : order) {
+              std::size_t best = num_groups;
+              for (std::size_t g = 0; g < num_groups; ++g) {
+                if (cand[g].size() >= max_per_group)
+                  continue;
+                if (best == num_groups || cand_rows[g] < cand_rows[best])
+                  best = g;
+              }
+              if (best == num_groups) {
+                best = 0;
+                for (std::size_t g = 1; g < num_groups; ++g)
+                  if (cand_rows[g] < cand_rows[best])
+                    best = g;
+              }
+              cand[best].push_back(idx);
+              cand_rows[best] += batch[idx].tokens.size() - 1;
+            }
+            bool overflow = false;
+            if (cap_s1 > 0 && num_groups < batch.size()) {
+              for (std::size_t g = 0; g < num_groups; ++g) {
+                if (cand[g].size() > 1 && cand_rows[g] > cap_s1) {
+                  overflow = true;
+                  break;
+                }
+              }
+            }
+            if (!overflow) {
+              for (auto &g : cand)
+                if (!g.empty())
+                  micro_groups.push_back(std::move(g));
+              break;
+            }
+          }
+        } else {
+          // Consistent mode preserves sequential sample order while still
+          // staying inside stride=1 capacity whenever possible.
+          const std::size_t max_per_group = static_cast<std::size_t>(micro_bsz);
+          for (std::size_t i = 0; i < batch.size();) {
+            std::vector<std::size_t> grp;
+            std::size_t rows_acc = 0;
+            while (i < batch.size() && grp.size() < max_per_group) {
+              const std::size_t r = batch[i].tokens.size() - 1;
+              if (!grp.empty() && cap_s1 > 0 && rows_acc + r > cap_s1)
+                break;
+              grp.push_back(i++);
+              rows_acc += r;
+            }
+            micro_groups.push_back(std::move(grp));
+          }
+        }
 #else
-            static_cast<std::size_t>(micro_bsz);
-#endif
+        const std::size_t step_bsz = static_cast<std::size_t>(micro_bsz);
         for (std::size_t first = 0; first < batch.size(); first += step_bsz) {
-          const std::size_t last =
-              std::min(batch.size(), first + step_bsz);
+          const std::size_t last = std::min(batch.size(), first + step_bsz);
+          std::vector<std::size_t> grp;
+          grp.reserve(last - first);
+          for (std::size_t i = first; i < last; ++i)
+            grp.push_back(i);
+          micro_groups.push_back(std::move(grp));
+        }
+#endif
+        for (const auto &grp : micro_groups) {
+          const std::size_t first = grp.front();
+          const std::size_t last = first + grp.size();
+          (void)last;
           if (micro_bsz == 1) {
             const auto &sample = batch[first];
             std::vector<float> weights(sample.train.begin(), sample.train.end());
@@ -623,7 +708,10 @@ int main(int argc, char **argv) {
           } else {
             std::vector<std::vector<int>> tokens, labels;
             std::vector<std::vector<float>> weights;
-            for (std::size_t i = first; i < last; ++i) {
+            tokens.reserve(grp.size());
+            labels.reserve(grp.size());
+            weights.reserve(grp.size());
+            for (const std::size_t i : grp) {
               tokens.push_back(batch[i].tokens);
               labels.push_back(batch[i].labels);
               weights.emplace_back(batch[i].train.begin(), batch[i].train.end());

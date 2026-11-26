@@ -31,6 +31,8 @@ public:
   // Reserve the maximum sequence's boundary checkpoints once. Backward keeps
   // this high-water allocation, including across shorter micro-batches.
   void reserve_sequence(int tokens);
+  // Maximum total rows that fit in the stride=1 layer-input cache (0 if unallocated).
+  size_t stride1_row_capacity() const;
   void reset(const float *initial);
   // Last computes only the final token's output head; None advances states
   // without an output head. last_logits() is unavailable after None.

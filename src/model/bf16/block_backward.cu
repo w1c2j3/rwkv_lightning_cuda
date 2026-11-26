@@ -25,6 +25,74 @@ __device__ __forceinline__ float warp_sum(float x) {
   return x;
 }
 
+#ifdef RWKV_USE_HIP
+__device__ __forceinline__ float wave64_sum(float v) {
+  v += __shfl_xor(v, 32, 64);
+  v += __shfl_xor(v, 16, 64);
+  v += __shfl_xor(v, 8, 64);
+  v += __shfl_xor(v, 4, 64);
+  v += __shfl_xor(v, 2, 64);
+  v += __shfl_xor(v, 1, 64);
+  return v;
+}
+__global__ __launch_bounds__(256) void post_backward_kernel_w64(
+    int H, int total_heads, const bf16 *__restrict__ group_norm,
+    const bf16 *__restrict__ r, const bf16 *__restrict__ k,
+    const bf16 *__restrict__ v, const bf16 *__restrict__ r_k,
+    const bf16 *__restrict__ gate, const bf16 *__restrict__ dz,
+    bf16 *__restrict__ d_group_norm, bf16 *__restrict__ dr,
+    bf16 *__restrict__ dk, bf16 *__restrict__ dv, bf16 *__restrict__ d_gate) {
+  const int bth = blockIdx.x * 4 + (threadIdx.x >> 6);
+  if (bth >= total_heads) return;
+  const int head = bth % H;
+  const int lane = threadIdx.x & 63;
+  const long long idx = static_cast<long long>(bth) * kN + lane;
+  const int c = head * kN + lane;
+  const float rv = to_float(r[idx]);
+  const float kv = to_float(k[idx]);
+  const float vv = to_float(v[idx]);
+  const float gv = to_float(gate[idx]);
+  const float upstream = to_float(dz[idx]);
+  const float rk = to_float(r_k[c]);
+  const float q = wave64_sum(rv * kv * rk);
+  const float dq = wave64_sum(upstream * gv * vv);
+  d_group_norm[idx] = to_bf16(upstream * gv);
+  dr[idx] = to_bf16(dq * kv * rk);
+  dk[idx] = to_bf16(dq * rv * rk);
+  dv[idx] = to_bf16(upstream * gv * q);
+  d_gate[idx] = to_bf16(upstream * (to_float(group_norm[idx]) + q * vv));
+}
+__global__ __launch_bounds__(256) void kk_backward_kernel_w64(
+    int H, int total_heads, const bf16 *__restrict__ original_k,
+    const bf16 *__restrict__ alpha, const bf16 *__restrict__ neg_kk,
+    const bf16 *__restrict__ k_k, const bf16 *__restrict__ k_a,
+    const bf16 *__restrict__ dk_direct, const bf16 *__restrict__ d_new_k,
+    const bf16 *__restrict__ d_neg_kk, const bf16 *__restrict__ d_kka,
+    bf16 *__restrict__ dk, bf16 *__restrict__ d_a12) {
+  const int bth = blockIdx.x * 4 + (threadIdx.x >> 6);
+  if (bth >= total_heads) return;
+  const int head = bth % H;
+  const int lane = threadIdx.x & 63;
+  const long long idx = static_cast<long long>(bth) * kN + lane;
+  const int c = head * kN + lane;
+  const float kval = to_float(original_k[idx]);
+  const float scale_k = to_float(k_k[c]);
+  const float u = kval * scale_k;
+  const float kk = -to_float(neg_kk[idx]);
+  const float av = to_float(alpha[idx]);
+  const float ka = to_float(k_a[c]);
+  const float dnew = to_float(dk_direct[idx]) + to_float(d_new_k[idx]);
+  const float dkk = -to_float(d_neg_kk[idx]) + to_float(d_kka[idx]) * av;
+  const float norm = sqrtf(wave64_sum(u * u));
+  const float inv = 1.0f / fmaxf(norm, 1.0e-12f);
+  const float dot = wave64_sum(dkk * kk);
+  const float du = norm > 1.0e-12f ? (dkk - kk * dot) * inv : dkk * inv;
+  const float mix_scale = 1.0f - ka + av * ka;
+  const float da = to_float(d_kka[idx]) * kk + dnew * kval * ka;
+  dk[idx] = to_bf16(dnew * mix_scale + du * scale_k);
+  d_a12[idx] = to_bf16(da * av * (1.0f - av));
+}
+#endif
 __global__ __launch_bounds__(kN) void post_backward_kernel(
     int H, const bf16 *__restrict__ group_norm, const bf16 *__restrict__ r,
     const bf16 *__restrict__ k, const bf16 *__restrict__ v,
@@ -105,6 +173,65 @@ __global__ __launch_bounds__(kN) void kk_backward_kernel(
   d_a12[idx] = to_bf16(da * av * (1.0f - av));
 }
 
+#ifdef RWKV_USE_HIP
+struct Bf16x8BlkBwd { bf16 v[8]; };
+__device__ __forceinline__ Bf16x8BlkBwd ld8_bb(const bf16 *p) {
+  union { uint4 u; Bf16x8BlkBwd b; } r;
+  r.u = *reinterpret_cast<const uint4 *>(p);
+  return r.b;
+}
+__device__ __forceinline__ void st8_bb(bf16 *p, Bf16x8BlkBwd b) {
+  union { uint4 u; Bf16x8BlkBwd b; } r;
+  r.b = b;
+  *reinterpret_cast<uint4 *>(p) = r.u;
+}
+static inline bool aligned16_bb(const void *p) {
+  return (reinterpret_cast<uintptr_t>(p) & 15u) == 0;
+}
+__global__ void
+vres_backward_kernel_v8(const bf16 *__restrict__ v_base,
+                        const bf16 *__restrict__ v_first,
+                        const bf16 *__restrict__ gate,
+                        const bf16 *__restrict__ dv,
+                        bf16 *__restrict__ dv_base, bf16 *__restrict__ dv12,
+                        bf16 *__restrict__ dv_first, std::size_t n8) {
+  const std::size_t i8 =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i8 >= n8)
+    return;
+  const Bf16x8BlkBwd gv = ld8_bb(gate + i8 * 8);
+  const Bf16x8BlkBwd dvv = ld8_bb(dv + i8 * 8);
+  const Bf16x8BlkBwd bv = ld8_bb(v_base + i8 * 8);
+  const Bf16x8BlkBwd fv = ld8_bb(v_first + i8 * 8);
+  Bf16x8BlkBwd dvb, dv12v;
+  if (dv_first) {
+    Bf16x8BlkBwd dvf = ld8_bb(dv_first + i8 * 8);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const float g = to_float(gv.v[k]);
+      const float u = to_float(dvv.v[k]);
+      const float b = to_float(bv.v[k]);
+      const float f = to_float(fv.v[k]);
+      dvb.v[k] = to_bf16(u * (1.0f - g));
+      dv12v.v[k] = to_bf16(u * (f - b) * g * (1.0f - g));
+      dvf.v[k] = to_bf16(to_float(dvf.v[k]) + u * g);
+    }
+    st8_bb(dv_first + i8 * 8, dvf);
+  } else {
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const float g = to_float(gv.v[k]);
+      const float u = to_float(dvv.v[k]);
+      const float b = to_float(bv.v[k]);
+      const float f = to_float(fv.v[k]);
+      dvb.v[k] = to_bf16(u * (1.0f - g));
+      dv12v.v[k] = to_bf16(u * (f - b) * g * (1.0f - g));
+    }
+  }
+  st8_bb(dv_base + i8 * 8, dvb);
+  st8_bb(dv12 + i8 * 8, dv12v);
+}
+#endif
 __global__ void
 vres_backward_kernel(const bf16 *__restrict__ v_base,
                      const bf16 *__restrict__ v_first,
@@ -323,6 +450,13 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   linear_orig_backward_input_bf16(stream, rows, C, C, grad_x_after, w.output,
                                   d_post);
   rwkv_bf16_nora::backward_target(stream, w, tape, 3, grad_x_after, d_post);
+#ifdef RWKV_USE_HIP
+  if (is_wave64_device()) {
+    post_backward_kernel_w64<<<(rows * w.heads + 3) / 4, 256, 0, stream>>>(
+        w.heads, rows * w.heads, tape.att_group_norm, tape.r, tape.wkv_k, tape.v, w.r_k,
+        tape.att_gate, d_post, d_gn, post_dr, post_dk, post_dv, d_gate);
+  } else
+#endif
   post_backward_kernel<<<rows * w.heads, kN, 0, stream>>>(
       w.heads, tape.att_group_norm, tape.r, tape.wkv_k, tape.v, w.r_k,
       tape.att_gate, d_post, d_gn, post_dr, post_dk, post_dv, d_gate);
@@ -350,6 +484,13 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
       rwkv_bf16_nora::backward_target(stream, w, tape, 0, wkv_dr, nullptr);
     }
     if (need_k) {
+#ifdef RWKV_USE_HIP
+      if (is_wave64_device()) {
+        kk_backward_kernel_w64<<<(rows * w.heads + 3) / 4, 256, 0, stream>>>(
+            w.heads, rows * w.heads, tape.k, tape.alpha, tape.neg_kk, w.k_k, w.k_a, post_dk,
+            d_wkv_k, d_neg_kk, d_kka, d_k, d_a12);
+      } else
+#endif
       kk_backward_kernel<<<rows * w.heads, kN, 0, stream>>>(
           w.heads, tape.k, tape.alpha, tape.neg_kk, w.k_k, w.k_a, post_dk,
           d_wkv_k, d_neg_kk, d_kka, d_k, d_a12);
@@ -368,6 +509,13 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   add_inplace_bf16(stream, wkv_dr, post_dr, R);
   add_inplace_bf16(stream, d_v, post_dv, R);
 
+#ifdef RWKV_USE_HIP
+  if (is_wave64_device()) {
+    kk_backward_kernel_w64<<<(rows * w.heads + 3) / 4, 256, 0, stream>>>(
+        w.heads, rows * w.heads, tape.k, tape.alpha, tape.neg_kk, w.k_k, w.k_a, post_dk, d_wkv_k,
+        d_neg_kk, d_kka, d_k, d_a12);
+  } else
+#endif
   kk_backward_kernel<<<rows * w.heads, kN, 0, stream>>>(
       w.heads, tape.k, tape.alpha, tape.neg_kk, w.k_k, w.k_a, post_dk, d_wkv_k,
       d_neg_kk, d_kka, d_k, d_a12);
@@ -378,6 +526,16 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
     if (state_grad.v_first_grad)
       add_inplace_bf16(stream, d_v_base, state_grad.v_first_grad, R);
   } else {
+#ifdef RWKV_USE_HIP
+    if ((R & 7) == 0 && aligned16_bb(tape.v_base) &&
+        aligned16_bb(tape.v_first) && aligned16_bb(tape.v_gate) &&
+        aligned16_bb(d_v) && aligned16_bb(d_v_base) && aligned16_bb(d_v12) &&
+        (!state_grad.v_first_grad || aligned16_bb(state_grad.v_first_grad))) {
+      vres_backward_kernel_v8<<<blocks(R >> 3), kThreads, 0, stream>>>(
+          tape.v_base, tape.v_first, tape.v_gate, d_v, d_v_base, d_v12,
+          state_grad.v_first_grad, R >> 3);
+    } else
+#endif
     vres_backward_kernel<<<blocks(R), kThreads, 0, stream>>>(
         tape.v_base, tape.v_first, tape.v_gate, d_v, d_v_base, d_v12,
         state_grad.v_first_grad, R);
